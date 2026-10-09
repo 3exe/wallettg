@@ -592,10 +592,7 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
       <div class="warn" id="fin-info"></div>
       <strong>Твоя фраза для Gram Wallet, 24 слова. Перепиши все: без слов 13–24 доступ будет потерян.</strong>
       <ol class="words" id="fin-words"></ol>
-      <div class="row">
-        <label id="fin-q1-label">Слово № <input type="text" id="fin-q1" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-        <label id="fin-q2-label">Слово № <input type="text" id="fin-q2" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-      </div>
+      <div class="row"><button class="sec" id="fin-copy">Скопировать 24 слова</button></div>
       <div class="mains">
         <label><input type="radio" name="payer" value="main" checked><span><b>Оплатить с основного кошелька</b> (фраза сверху). На адрес ничего заранее отправлять не нужно, уйдёт ~0.01 TON, остаток останется на новом кошельке.</span></label>
         <label><input type="radio" name="payer" value="self"><span><b>Оплатить с самого кошелька</b>. На адресе уже должно быть ~0.02 TON.</span></label>
@@ -659,21 +656,30 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
       const anchor = $('fin-anchor').value.trim().toLowerCase().split(/\\s+/);
       if (r.rotated) { finMsg('fin-msg', 'Адрес ' + r.address + ' уже переключён на другие слова 13–24. Используй те 24 слова, которые получил тогда.', true); return; }
       const all = anchor.concat(r.signing.split(' '));
-      const q = [13 + Math.floor(Math.random() * 6), 19 + Math.floor(Math.random() * 6)];
-      fin = { anchor: anchor.join(' '), signing: r.signing, all, q };
+      fin = { anchor: anchor.join(' '), signing: r.signing, all };
       $('fin-info').innerHTML = 'Адрес: <span class="mono">' + esc(r.address) + '</span><br>Баланс: ' + esc(r.balance) + ' TON · ' + esc(r.status);
       $('fin-words').innerHTML = all.map((w, i) => '<li' + (i >= 12 ? ' class="new"' : '') + '>' + esc(w) + '</li>').join('');
-      $('fin-q1-label').firstChild.textContent = 'Проверка: слово № ' + q[0] + ' ';
-      $('fin-q2-label').firstChild.textContent = 'Слово № ' + q[1] + ' ';
-      $('fin-q1').value = ''; $('fin-q2').value = '';
+      $('fin-copy').textContent = 'Скопировать 24 слова';
       $('fin-step2').hidden = false; finMsg('fin-msg', ''); finMsg('fin-status', '');
     } catch (e) { finMsg('fin-msg', e.message, true); }
     finally { $('fin-check').disabled = false; }
   });
+  $('fin-copy').addEventListener('click', () => {
+    if (!fin) return;
+    const text = fin.all.join(' ');
+    const fallback = () => { // clipboard API is unavailable on plain http in some browsers: select the text instead
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+      let ok = false; try { ok = document.execCommand('copy'); } catch (_) {}
+      ta.remove();
+      $('fin-copy').textContent = ok ? 'Скопировано' : 'Не вышло, перепиши вручную';
+    };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(() => { $('fin-copy').textContent = 'Скопировано'; }, fallback);
+    else fallback();
+  });
   $('fin-go').addEventListener('click', async () => {
     if (!fin) return;
-    const a1 = $('fin-q1').value.trim().toLowerCase(), a2 = $('fin-q2').value.trim().toLowerCase();
-    if (a1 !== fin.all[fin.q[0] - 1] || a2 !== fin.all[fin.q[1] - 1]) return finMsg('fin-status', 'Слова не совпали. Перепиши фразу внимательно и введи проверочные слова ещё раз.', true);
     const payer = (document.querySelector('input[name=payer]:checked') || {}).value;
     if (payer === 'main' && !$('phrase').value.trim()) return finMsg('fin-status', 'Вставь фразу основного кошелька в поле сверху или выбери оплату с самого кошелька.', true);
     $('fin-go').disabled = true; finMsg('fin-status', 'Отправляю…');
