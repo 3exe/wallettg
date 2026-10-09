@@ -197,22 +197,29 @@ function halfKey(words) {
   return keyPairFromSeed(Buffer.from(hdkey.derivePath("m/44'/607'/0'", seed).key));
 }
 
+const OP_CHANGE_KEY_E = 0xfbba99c8;
+
+// Signed ChangePublicKey request: signed by the current (anchor) key, proven by the new (signing) key.
+// internal = sent inside a message from another wallet; external = sent by the wallet itself.
+export function rotationBody({ anchor, signing, address, net, seqno = 0, internal: isInternal = true, ttl = 86400 }) {
+  const proofPayload = beginCell().storeUint(ROTATION_TAG, 96).storeInt(0, 8).storeBuffer(address.hash).endCell();
+  const req = beginCell()
+    .storeUint(isInternal ? OP_CHANGE_KEY_I : OP_CHANGE_KEY_E, 32).storeUint(NETS[net].subwallet, 32)
+    .storeUint(Math.floor(Date.now() / 1000) + ttl, 32).storeUint(seqno, 32)
+    .storeBuffer(signing.publicKey)
+    .storeRef(beginCell().storeBuffer(sign(proofPayload.hash(), signing.secretKey)).endCell())
+    .storeRef(beginCell().storeBuffer(Buffer.alloc(32)).endCell()) // no old encrypted comments on a fresh wallet
+    .endCell();
+  return beginCell().storeBuffer(sign(req.hash(), anchor.secretKey)).storeSlice(req.beginParse()).endCell();
+}
+
 export async function newWallet(format, net) {
   if (format === 'gram') {
     const rnd = (n) => crypto.randomBytes(n);
     const anchorWords = bip39.generateMnemonic(128, rnd), signingWords = bip39.generateMnemonic(128, rnd);
     const anchor = halfKey(anchorWords), signing = halfKey(signingWords);
     const w = tgWallet(anchor.publicKey, net);
-    // ChangePublicKey (internal): signed by the anchor key, proven by the new (signing) key
-    const proofPayload = beginCell().storeUint(ROTATION_TAG, 96).storeInt(0, 8).storeBuffer(w.address.hash).endCell();
-    const req = beginCell()
-      .storeUint(OP_CHANGE_KEY_I, 32).storeUint(NETS[net].subwallet, 32)
-      .storeUint(Math.floor(Date.now() / 1000) + 86400, 32).storeUint(0, 32)
-      .storeBuffer(signing.publicKey)
-      .storeRef(beginCell().storeBuffer(sign(proofPayload.hash(), signing.secretKey)).endCell())
-      .storeRef(beginCell().storeBuffer(Buffer.alloc(32)).endCell()) // no old encrypted comments on a fresh wallet
-      .endCell();
-    const body = beginCell().storeBuffer(sign(req.hash(), anchor.secretKey)).storeSlice(req.beginParse()).endCell();
+    const body = rotationBody({ anchor, signing, address: w.address, net });
     return { phrase: `${anchorWords} ${signingWords}`, address: w.address, init: w.init, body, signKey: signing, anchorPub: anchor.publicKey, seqnoAfter: 1n };
   }
   const words = await mnemonicNew(24);
@@ -343,6 +350,81 @@ export async function runPipeline(job, { ctx, phrase, mainKind, amount, count, f
   job.stage = 'Готово';
 }
 
+// ------------------------------------------------------------------ finishing a mined (vanity) address
+// Words 1-12 come from the miner; words 13-24 are generated here. One message deploys the wallet and
+// switches it to words 13-24 — paid either by the main wallet (internal message, the address needs no
+// balance) or by the wallet itself (external message, the address needs ~0.02 TON).
+function parse12(text) {
+  const w = String(text || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (w.length !== 12) throw new Error(`нужно 12 слов, а здесь ${w.length}`);
+  if (!bip39.validateMnemonic(w.join(' '))) throw new Error('это не BIP39-фраза из 12 слов (опечатка или не тот порядок слов)');
+  return w.join(' ');
+}
+const keyNum = (pub) => BigInt('0x' + Buffer.from(pub).toString('hex'));
+
+export async function finPrepare(ctx, anchorText) {
+  const anchor = halfKey(parse12(anchorText));
+  const addr = fmt(tgWallet(anchor.publicKey, ctx.net).address, ctx.net);
+  const st = await call(ctx, 'state', addr);
+  let status = st.active ? 'развёрнут' : st.balance > 0n ? 'не развёрнут, есть баланс' : 'не развёрнут, пустой';
+  let rotated = false;
+  if (st.active) {
+    rotated = (await call(ctx, 'get', addr, 'get_public_key')) !== keyNum(anchor.publicKey);
+    status = rotated ? 'уже переключён на другие слова 13–24' : 'развёрнут, ключ пока из слов 1–12';
+  }
+  return { address: addr, balance: st.balance, active: st.active, status, rotated, signing: bip39.generateMnemonic(128, (n) => crypto.randomBytes(n)) };
+}
+
+export async function finRun(job, { ctx, anchorText, signingText, payer, phrase }) {
+  const log = (s) => { job.log.push(`${new Date().toLocaleTimeString()} ${s}`); };
+  const anchor = halfKey(parse12(anchorText)), signing = halfKey(parse12(signingText));
+  const w = tgWallet(anchor.publicKey, ctx.net);
+  const addr = fmt(w.address, ctx.net);
+  const row = { n: 1, address: addr, status: 'проверяю' };
+  job.rows = [row];
+  job.stage = 'Финализация';
+  const st = await call(ctx, 'state', addr);
+  let seqno = 0;
+  if (st.active) {
+    const pk = await call(ctx, 'get', addr, 'get_public_key');
+    if (pk === keyNum(signing.publicKey)) { row.status = 'готово'; job.stage = 'Уже готово'; return; }
+    if (pk !== keyNum(anchor.publicKey)) throw new Error('кошелёк уже переключён на другие слова 13–24; слова 1–12 им больше не управляют');
+    seqno = Number(await call(ctx, 'get', addr, 'seqno'));
+  }
+  row.status = 'отправляю';
+  if (payer === 'main') {
+    const key = await keyFromPhrase(phrase);
+    const best = (await inspectMain(ctx, phrase))[0];
+    if (best.balance < toNano('0.02')) throw new Error('на основном кошельке меньше 0.02 TON');
+    const main = senders(key, ctx.net).find((s) => s.kind === best.kind);
+    const body = rotationBody({ anchor, signing, address: w.address, net: ctx.net, seqno, internal: true, ttl: 900 });
+    // 0.01 TON: covers the gas, the rest stays on the new wallet
+    await sendMany(ctx, main, [internal({ to: w.address, value: toNano('0.01'), bounce: false, init: st.active ? undefined : w.init, body })]);
+    log(`Оплачено с основного кошелька ${best.kind} ${best.address}`);
+  } else {
+    if (!st.active && st.balance < toNano('0.015')) throw new Error('на адресе нужно хотя бы 0.02 TON (или выбери оплату с основного кошелька)');
+    const body = rotationBody({ anchor, signing, address: w.address, net: ctx.net, seqno, internal: false, ttl: 120 });
+    const ext = external({ to: w.address, init: st.active ? undefined : w.init, body });
+    await call(ctx, 'send', beginCell().store(storeMessage(ext)).endCell().toBoc().toString('base64'));
+    log('Транзакция отправлена с самого кошелька');
+  }
+  row.status = 'жду подтверждения';
+  for (let i = 0; i < (ctx.confirmTries ?? 40); i++) {
+    await sleep(ctx.pollMs ?? 3000);
+    try {
+      const s2 = await call(ctx, 'state', addr);
+      if (s2.active && (await call(ctx, 'get', addr, 'get_public_key')) === keyNum(signing.publicKey)) {
+        row.status = 'готово';
+        row.left = fromNano(s2.balance);
+        log('Кошелёк развёрнут и переключён на слова 13–24');
+        job.stage = 'Готово';
+        return;
+      }
+    } catch (_) { /* keep waiting */ }
+  }
+  throw new Error('не подтвердилось за 2 минуты; проверь адрес на tonviewer.com и повтори (повтор безопасен)');
+}
+
 // ------------------------------------------------------------------ server
 const TOKEN = crypto.randomBytes(16).toString('hex');
 const jobs = new Map();
@@ -400,6 +482,20 @@ function handler(req, res) {
           .catch((e) => { job.error = e.message; }).finally(() => { job.done = true; });
         return send(200, { id });
       }
+      if (url.pathname === '/api/fin/prepare') {
+        return send(200, await finPrepare(ctxFrom(b), b.anchor));
+      }
+      if (url.pathname === '/api/fin/run') {
+        const ctx = ctxFrom(b);
+        parse12(b.anchor); parse12(b.signing);
+        if (b.payer === 'main') await keyFromPhrase(b.phrase || '');
+        const id = crypto.randomBytes(6).toString('hex');
+        const job = { id, rows: [], log: [], stage: 'Запуск', done: false, error: null };
+        jobs.set(id, job);
+        finRun(job, { ctx, anchorText: b.anchor, signingText: b.signing, payer: b.payer, phrase: b.phrase })
+          .catch((e) => { job.error = e.message; }).finally(() => { job.done = true; });
+        return send(200, { id });
+      }
       if (url.pathname === '/api/cancel') { const j = jobs.get(b.id); if (j) j.cancel = true; return send(200, { ok: true }); }
       send(404, { error: 'not found' });
     } catch (e) { send(400, { error: e.message }); }
@@ -442,6 +538,14 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .st.ok { color: var(--ok); } .st.bad { color: var(--bad); } .st.run { color: var(--accent); }
 .err-text { color: var(--bad); font-size: .8rem; }
 .log { font: 12px/1.6 var(--mono); color: var(--muted); max-height: 160px; overflow-y: auto; white-space: pre-wrap; }
+.tabs { display:flex; gap:6px; flex-wrap:wrap; }
+.tabs button { border:1px solid var(--line); background:var(--surface); color:var(--fg); padding:8px 14px; border-radius:8px; }
+.tabs button[aria-selected=true] { border-color: var(--accent); background: var(--soft); color: var(--accent); font-weight: 600; }
+.words { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:6px; margin:0; padding:0; list-style:none; counter-reset: w; }
+@media (max-width: 440px) { .words { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.words li { counter-increment: w; font: 14px var(--mono); padding: 5px 8px; background: var(--bg); border-radius: 6px; white-space: nowrap; }
+.words li::before { content: counter(w) "."; color: var(--muted); margin-right: 6px; font-size: .78rem; }
+.words li.new { border: 1px solid var(--accent); }
 [hidden] { display:none !important; }
 </style></head><body>
 <div class="wrap">
@@ -450,6 +554,18 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
   <section class="panel">
     <label>Фраза основного кошелька (24 слова) <input type="password" id="phrase" autocomplete="off" spellcheck="false"></label>
+    <div class="row">
+      <label>Токен toncenter (API-ключ, необязательно) <input type="password" id="apikey" autocomplete="off" placeholder="без токена — медленнее, по одному кошельку"></label>
+      <label style="flex:0 0 auto;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="testnet"> Тестовая сеть</label>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="auto" aria-selected="true">Кошельки</button>
+    <button role="tab" data-tab="fin" aria-selected="false">Доделать свой адрес</button>
+  </nav>
+
+  <section class="panel" data-panel="auto">
     <div class="row">
       <label>Сумма на каждый кошелёк, TON <input type="text" id="amount" value="0.05" inputmode="decimal"></label>
       <label>Количество кошельков <input type="number" id="count" min="1" max="1000" value="5"></label>
@@ -463,12 +579,30 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
       </label>
       <label style="flex:0 0 auto;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="refund" checked> Вернуть остаток на основной</label>
     </div>
-    <div class="row">
-      <label>Токен toncenter (API-ключ, необязательно) <input type="password" id="apikey" autocomplete="off" placeholder="без токена — медленнее, по одному кошельку"></label>
-      <label style="flex:0 0 auto;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="testnet"> Тестовая сеть</label>
-    </div>
     <div class="row"><button class="act" id="check">Проверить</button></div>
     <p class="msg" id="msg"></p>
+  </section>
+
+  <section class="panel" data-panel="fin" hidden>
+    <p class="hint">Для адреса из майнера: вставь его 12 слов. Здесь создадутся слова 13–24, и одна транзакция развернёт кошелёк и переключит его на них. После этого все 24 слова импортируются в Gram Wallet, а слова 1–12 больше ничего не подписывают.</p>
+    <label>12 слов из майнера <input type="password" id="fin-anchor" autocomplete="off" spellcheck="false"></label>
+    <div class="row"><button class="act" id="fin-check">Проверить адрес</button></div>
+    <p class="msg" id="fin-msg"></p>
+    <div id="fin-step2" hidden style="display:grid;gap:12px">
+      <div class="warn" id="fin-info"></div>
+      <strong>Твоя фраза для Gram Wallet, 24 слова. Перепиши все: без слов 13–24 доступ будет потерян.</strong>
+      <ol class="words" id="fin-words"></ol>
+      <div class="row">
+        <label id="fin-q1-label">Слово № <input type="text" id="fin-q1" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label id="fin-q2-label">Слово № <input type="text" id="fin-q2" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      </div>
+      <div class="mains">
+        <label><input type="radio" name="payer" value="main" checked><span><b>Оплатить с основного кошелька</b> (фраза сверху). На адрес ничего заранее отправлять не нужно, уйдёт ~0.01 TON, остаток останется на новом кошельке.</span></label>
+        <label><input type="radio" name="payer" value="self"><span><b>Оплатить с самого кошелька</b>. На адресе уже должно быть ~0.02 TON.</span></label>
+      </div>
+      <div class="row"><button class="act" id="fin-go">Развернуть и переключить</button></div>
+      <p class="msg" id="fin-status"></p>
+    </div>
   </section>
 
   <section class="panel" id="confirm" hidden>
@@ -507,6 +641,56 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
   const input = () => ({ phrase: $('phrase').value, amount: $('amount').value, count: $('count').value,
     apiKey: $('apikey').value, net: $('testnet').checked ? 'testnet' : 'mainnet', format: $('format').value, refund: $('refund').checked });
   const msg = (t, err) => { $('msg').textContent = t || ''; $('msg').className = 'msg' + (err ? ' err' : ''); };
+
+  // tabs
+  document.querySelectorAll('.tabs button').forEach((b) => b.addEventListener('click', () => {
+    document.querySelectorAll('.tabs button').forEach((x) => x.setAttribute('aria-selected', String(x === b)));
+    document.querySelectorAll('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== b.dataset.tab));
+    if (b.dataset.tab === 'fin') { $('confirm').hidden = true; $('result').hidden = true; }
+  }));
+
+  // ---- finishing a mined address
+  let fin = null;
+  const finMsg = (el, t, err) => { $(el).textContent = t || ''; $(el).className = 'msg' + (err ? ' err' : ''); };
+  $('fin-check').addEventListener('click', async () => {
+    finMsg('fin-msg', 'Проверяю…'); $('fin-step2').hidden = true; $('fin-check').disabled = true;
+    try {
+      const r = await api('fin/prepare', { anchor: $('fin-anchor').value, apiKey: $('apikey').value, net: $('testnet').checked ? 'testnet' : 'mainnet' });
+      const anchor = $('fin-anchor').value.trim().toLowerCase().split(/\\s+/);
+      if (r.rotated) { finMsg('fin-msg', 'Адрес ' + r.address + ' уже переключён на другие слова 13–24. Используй те 24 слова, которые получил тогда.', true); return; }
+      const all = anchor.concat(r.signing.split(' '));
+      const q = [13 + Math.floor(Math.random() * 6), 19 + Math.floor(Math.random() * 6)];
+      fin = { anchor: anchor.join(' '), signing: r.signing, all, q };
+      $('fin-info').innerHTML = 'Адрес: <span class="mono">' + esc(r.address) + '</span><br>Баланс: ' + esc(r.balance) + ' TON · ' + esc(r.status);
+      $('fin-words').innerHTML = all.map((w, i) => '<li' + (i >= 12 ? ' class="new"' : '') + '>' + esc(w) + '</li>').join('');
+      $('fin-q1-label').firstChild.textContent = 'Проверка: слово № ' + q[0] + ' ';
+      $('fin-q2-label').firstChild.textContent = 'Слово № ' + q[1] + ' ';
+      $('fin-q1').value = ''; $('fin-q2').value = '';
+      $('fin-step2').hidden = false; finMsg('fin-msg', ''); finMsg('fin-status', '');
+    } catch (e) { finMsg('fin-msg', e.message, true); }
+    finally { $('fin-check').disabled = false; }
+  });
+  $('fin-go').addEventListener('click', async () => {
+    if (!fin) return;
+    const a1 = $('fin-q1').value.trim().toLowerCase(), a2 = $('fin-q2').value.trim().toLowerCase();
+    if (a1 !== fin.all[fin.q[0] - 1] || a2 !== fin.all[fin.q[1] - 1]) return finMsg('fin-status', 'Слова не совпали. Перепиши фразу внимательно и введи проверочные слова ещё раз.', true);
+    const payer = (document.querySelector('input[name=payer]:checked') || {}).value;
+    if (payer === 'main' && !$('phrase').value.trim()) return finMsg('fin-status', 'Вставь фразу основного кошелька в поле сверху или выбери оплату с самого кошелька.', true);
+    $('fin-go').disabled = true; finMsg('fin-status', 'Отправляю…');
+    try {
+      const { id } = await api('fin/run', { anchor: fin.anchor, signing: fin.signing, payer, phrase: $('phrase').value,
+        apiKey: $('apikey').value, net: $('testnet').checked ? 'testnet' : 'mainnet' });
+      for (;;) {
+        const j = await api('job/' + id);
+        const row = j.rows[0] || {};
+        if (j.error) { finMsg('fin-status', 'Ошибка: ' + j.error, true); break; }
+        if (j.done) { finMsg('fin-status', 'Готово: кошелёк развёрнут и переключён на слова 13–24' + (row.left ? ', на нём ' + row.left + ' TON' : '') + '. Импортируй все 24 слова в Gram Wallet.'); break; }
+        finMsg('fin-status', row.status ? row.status.charAt(0).toUpperCase() + row.status.slice(1) + '…' : 'Выполняется…');
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    } catch (e) { finMsg('fin-status', e.message, true); }
+    finally { $('fin-go').disabled = false; }
+  });
 
   $('check').addEventListener('click', async () => {
     msg('Проверяю основной кошелёк…'); $('check').disabled = true;
