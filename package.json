@@ -1,0 +1,19 @@
+{
+  "name": "wallettg-autowallets",
+  "version": "1.0.0",
+  "description": "Create, fund, deploy and refund Telegram WalletTg wallets from a local web UI",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node autowallets.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0",
+    "@ton/sandbox": "^0.45.0",
+    "@ton/ton": "^16.3.0"
+  }
+}
