@@ -14,8 +14,10 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { exec } from 'node:child_process';
 import { Cell, beginCell, contractAddress, Address, Dictionary, internal, external, storeMessage, storeMessageRelaxed, toNano, fromNano } from '@ton/core';
-import { mnemonicNew, mnemonicToPrivateKey, mnemonicValidate, sign } from '@ton/crypto';
+import { mnemonicNew, mnemonicToPrivateKey, mnemonicValidate, sign, keyPairFromSeed } from '@ton/crypto';
 import { WalletContractV5R1, WalletContractV4 } from '@ton/ton';
+import bip39 from 'bip39';
+import hdkey from 'ed25519-hd-key';
 
 // ------------------------------------------------------------------ WalletTg
 const TRAMPOLINE = Cell.fromBoc(Buffer.from('b5ee9c7241010101001a000030ff00209821d7498308b9f240df8085f833d0ed1e20ed53d969427e39', 'hex'))[0];
@@ -139,8 +141,9 @@ async function waitSeqno(ctx, addr, seqno) {
 
 // ------------------------------------------------------------------ wallets that can send
 // Main wallet: WalletTg, W5 or V4 from the same 24 words. Each kind: max messages per transaction + a builder.
-export function senders(key, net) {
-  const tg = tgWallet(key.publicKey, net);
+// For a Gram Wallet (12+12) the WalletTg address comes from the anchor key while `key` signs.
+export function senders(key, net, anchorPub = key.publicKey) {
+  const tg = tgWallet(anchorPub, net);
   const v5 = WalletContractV5R1.create({ workchain: 0, publicKey: key.publicKey, walletId: { networkGlobalId: NETS[net].v5id } });
   const v4 = WalletContractV4.create({ workchain: 0, publicKey: key.publicKey });
   const validUntil = () => Math.floor(Date.now() / 1000) + 120;
@@ -182,9 +185,46 @@ export async function sendMany(ctx, w, msgs, onChunk = () => {}) {
   }
 }
 
+// ------------------------------------------------------------------ new wallets
+// Both formats are deployed by the funding message itself (it carries the StateInit), so the new
+// wallet never sends a deploy transaction. Gram Wallet format also switches the key in that message.
+const OP_CHANGE_KEY_I = 0xfbba99c7;
+const ROTATION_TAG = 0x4b45595f524f544154494f4en; // "KEY_ROTATION"
+
+// Same derivation as Gram Wallet / MyTonWallet: BIP39 seed -> SLIP-10 m/44'/607'/0'
+function halfKey(words) {
+  const seed = bip39.mnemonicToSeedSync(words).toString('hex');
+  return keyPairFromSeed(Buffer.from(hdkey.derivePath("m/44'/607'/0'", seed).key));
+}
+
+export async function newWallet(format, net) {
+  if (format === 'gram') {
+    const rnd = (n) => crypto.randomBytes(n);
+    const anchorWords = bip39.generateMnemonic(128, rnd), signingWords = bip39.generateMnemonic(128, rnd);
+    const anchor = halfKey(anchorWords), signing = halfKey(signingWords);
+    const w = tgWallet(anchor.publicKey, net);
+    // ChangePublicKey (internal): signed by the anchor key, proven by the new (signing) key
+    const proofPayload = beginCell().storeUint(ROTATION_TAG, 96).storeInt(0, 8).storeBuffer(w.address.hash).endCell();
+    const req = beginCell()
+      .storeUint(OP_CHANGE_KEY_I, 32).storeUint(NETS[net].subwallet, 32)
+      .storeUint(Math.floor(Date.now() / 1000) + 86400, 32).storeUint(0, 32)
+      .storeBuffer(signing.publicKey)
+      .storeRef(beginCell().storeBuffer(sign(proofPayload.hash(), signing.secretKey)).endCell())
+      .storeRef(beginCell().storeBuffer(Buffer.alloc(32)).endCell()) // no old encrypted comments on a fresh wallet
+      .endCell();
+    const body = beginCell().storeBuffer(sign(req.hash(), anchor.secretKey)).storeSlice(req.beginParse()).endCell();
+    return { phrase: `${anchorWords} ${signingWords}`, address: w.address, init: w.init, body, signKey: signing, anchorPub: anchor.publicKey, seqnoAfter: 1n };
+  }
+  const words = await mnemonicNew(24);
+  const key = await mnemonicToPrivateKey(words);
+  const w = tgWallet(key.publicKey, net);
+  return { phrase: words.join(' '), address: w.address, init: w.init, body: undefined, signKey: key, anchorPub: key.publicKey, seqnoAfter: 0n };
+}
+
 // ------------------------------------------------------------------ fee emulation
-// Runs deploy + return on a local copy of the chain (same WalletTg code and fee rules) and measures fees.
-export async function estimateFees(ctx) {
+// Runs funding-with-deploy + return on a local copy of the chain (same WalletTg code and fee rules).
+// deploy = what the incoming funding message loses on the way in; ret = fee of the refund transaction.
+export async function estimateFees(ctx, format) {
   const { Blockchain } = await import('@ton/sandbox');
   const bc = await Blockchain.create();
   const code = Cell.fromBase64(WALLETTG_CODE_B64);
@@ -198,13 +238,13 @@ export async function estimateFees(ctx) {
     async send(boc) { await bc.sendMessage(Cell.fromBase64(boc)); },
   };
   const sctx = { net: ctx.net, providers: [sim], pollMs: 1, confirmTries: 3 };
-  const key = await mnemonicToPrivateKey(await mnemonicNew());
-  const w = senders(key, ctx.net)[0];
+  const nw = await newWallet(format, ctx.net);
+  const w = senders(nw.signKey, ctx.net, nw.anchorPub)[0];
   const addr = fmt(w.address, ctx.net);
   const start = toNano('0.1');
-  await (await bc.treasury('main')).send({ to: w.address, value: start, bounce: false });
-  await sendMany(sctx, w, [internal({ to: w.address, value: 0n, bounce: false, body: 'deploy' })]);
+  await (await bc.treasury('main')).send({ to: nw.address, value: start, bounce: false, init: nw.init, body: nw.body });
   const b0 = (await sim.state(addr)).balance;
+  if (!(await sim.state(addr)).active) throw new Error('эмуляция: кошелёк не развернулся входящим сообщением');
   const back = (await bc.treasury('main')).address;
   await sendMany(sctx, w, [internal({ to: back, value: 1n, bounce: false })]);
   const b1 = (await sim.state(addr)).balance;
@@ -232,7 +272,7 @@ export async function inspectMain(ctx, phrase) {
   return out;
 }
 
-export async function runPipeline(job, { ctx, phrase, mainKind, amount, count }) {
+export async function runPipeline(job, { ctx, phrase, mainKind, amount, count, format = 'ton', refund = true }) {
   const log = (s) => { job.log.push(`${new Date().toLocaleTimeString()} ${s}`); };
   const key = await keyFromPhrase(phrase);
   const main = senders(key, ctx.net).find((w) => w.kind === mainKind);
@@ -240,47 +280,49 @@ export async function runPipeline(job, { ctx, phrase, mainKind, amount, count })
   const value = toNano(amount);
 
   job.stage = 'Считаю комиссии';
-  const fees = await estimateFees(ctx);
+  const fees = await estimateFees(ctx, format);
   job.fees = { deploy: fromNano(fees.deploy), ret: fromNano(fees.ret) };
-  log(`Комиссии по эмуляции: развёртывание ${fromNano(fees.deploy)}, возврат ${fromNano(fees.ret)} TON`);
-  if (value <= fees.deploy + fees.ret + RESERVE) throw new Error(`сумма слишком мала: нужно больше ${fromNano(fees.deploy + fees.ret + RESERVE)} TON на кошелёк`);
+  log(`Комиссии по эмуляции: развёртывание (из входящего платежа) ${fromNano(fees.deploy)}, возврат ${fromNano(fees.ret)} TON`);
+  const minimum = fees.deploy + (refund ? fees.ret + RESERVE : 0n);
+  if (value <= minimum) throw new Error(`сумма слишком мала: нужно больше ${fromNano(minimum)} TON на кошелёк`);
 
   job.stage = 'Создаю кошельки';
   job.rows = Array.from({ length: count }, (_, i) => ({ n: i + 1, status: 'создаю' }));
-  const keys = [];
+  const wallets = [];
   await pool(job.rows, os.cpus().length, async (row, k) => {
-    const words = await mnemonicNew(24);
-    keys[k] = await mnemonicToPrivateKey(words);
-    row.phrase = words.join(' ');
-    row.address = fmt(tgWallet(keys[k].publicKey, ctx.net).address, ctx.net);
+    wallets[k] = await newWallet(format, ctx.net);
+    row.phrase = wallets[k].phrase;
+    row.address = fmt(wallets[k].address, ctx.net);
     row.status = 'создан';
   });
-  log(`Создано кошельков: ${count}`);
+  log(`Создано кошельков: ${count} (${format === 'gram' ? 'Gram Wallet, 12+12 слов' : 'TON, 24 слова'})`);
   if (job.cancel) throw new Error('остановлено');
 
-  job.stage = 'Рассылка';
-  const msgs = job.rows.map((r) => internal({ to: Address.parse(r.address), value, bounce: false }));
+  // every funding message carries the StateInit (and for Gram Wallet the key switch): it deploys the wallet
+  job.stage = 'Рассылка и развёртывание';
+  const msgs = wallets.map((nw) => internal({ to: nw.address, value, bounce: false, init: nw.init, body: nw.body }));
   job.rows.forEach((r) => (r.status = 'жду пополнения'));
   await sendMany(ctx, main, msgs, (done) => log(`Отправлено ${done} из ${count}`));
   log(`Рассылка с ${mainAddr} завершена`);
 
-  job.stage = 'Развёртывание и возврат';
+  job.stage = refund ? 'Проверка и возврат' : 'Проверка';
   await pool(job.rows, ctx.concurrency, async (row, k) => {
     if (job.cancel) { row.status = 'остановлено'; return; }
-    const w = senders(keys[k], ctx.net)[0];
+    const nw = wallets[k];
+    const w = senders(nw.signKey, ctx.net, nw.anchorPub)[0];
     try {
-      row.status = 'жду пополнения';
-      let st;
+      row.status = 'жду развёртывания';
       for (let i = 0; ; i++) {
-        st = await call(ctx, 'state', row.address);
-        if (st.balance >= value / 2n) break;
-        if (i > 60) throw new Error('пополнение не пришло за 3 минуты');
+        const st = await call(ctx, 'state', row.address);
+        if (st.active && (await call(ctx, 'get', row.address, 'seqno')) >= nw.seqnoAfter) break;
+        if (i > 60) throw new Error('кошелёк не развернулся за 3 минуты (проверь адрес на tonviewer.com)');
         await sleep(ctx.pollMs ?? 3000);
       }
-      if (!st.active) {
-        row.status = 'разворачиваю';
-        await sendMany(ctx, w, [internal({ to: w.address, value: 0n, bounce: false, body: 'deploy' })]);
+      if (format === 'gram') {
+        const pk = await call(ctx, 'get', row.address, 'get_public_key');
+        if (pk !== BigInt('0x' + Buffer.from(nw.signKey.publicKey).toString('hex'))) throw new Error('ключ не переключился на слова 13–24');
       }
+      if (!refund) { row.status = 'готово'; row.left = fromNano((await call(ctx, 'state', row.address)).balance); return; }
       row.status = 'возвращаю';
       let margin = fees.ret + RESERVE;
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -320,7 +362,7 @@ function parseInput(b) {
   if (!/^\d+(\.\d{1,9})?$/.test(amount) || Number(amount) <= 0) throw new Error('укажи сумму на кошелёк, например 0.05');
   const count = Math.floor(Number(b.count));
   if (!(count >= 1 && count <= 1000)) throw new Error('количество кошельков от 1 до 1000');
-  return { amount, count };
+  return { amount, count, format: b.format === 'gram' ? 'gram' : 'ton', refund: b.refund !== false };
 }
 
 function handler(req, res) {
@@ -343,18 +385,18 @@ function handler(req, res) {
       const b = await readBody(req);
       if (url.pathname === '/api/inspect') {
         const ctx = ctxFrom(b);
-        const { amount, count } = parseInput(b);
+        const { amount, count, format, refund } = parseInput(b);
         const mains = await inspectMain(ctx, b.phrase || '');
-        return send(200, { mains, amount, count });
+        return send(200, { mains, amount, count, format, refund });
       }
       if (url.pathname === '/api/run') {
         const ctx = ctxFrom(b);
-        const { amount, count } = parseInput(b);
+        const { amount, count, format, refund } = parseInput(b);
         if (!['WalletTg', 'W5', 'V4'].includes(b.mainKind)) throw new Error('не выбран основной кошелёк');
         const id = crypto.randomBytes(6).toString('hex');
         const job = { id, rows: [], log: [], stage: 'Запуск', done: false, error: null };
         jobs.set(id, job);
-        runPipeline(job, { ctx, phrase: b.phrase, mainKind: b.mainKind, amount, count })
+        runPipeline(job, { ctx, phrase: b.phrase, mainKind: b.mainKind, amount, count, format, refund })
           .catch((e) => { job.error = e.message; }).finally(() => { job.done = true; });
         return send(200, { id });
       }
@@ -404,13 +446,22 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 </style></head><body>
 <div class="wrap">
   <h1>Auto Wallets</h1>
-  <p class="hint">Создаёт кошельки WalletTg, пополняет их с основного кошелька, разворачивает и возвращает остаток назад, оставляя на каждом 0.001 TON. Всё считается на этом компьютере; в сеть уходят только подписанные транзакции.</p>
+  <p class="hint">Создаёт кошельки WalletTg и пополняет их с основного кошелька. Пополнение само разворачивает кошелёк: отдельной транзакции развёртывания нет. По желанию остаток возвращается назад, на каждом остаётся 0.001 TON. Всё считается на этом компьютере; в сеть уходят только подписанные транзакции.</p>
 
   <section class="panel">
     <label>Фраза основного кошелька (24 слова) <input type="password" id="phrase" autocomplete="off" spellcheck="false"></label>
     <div class="row">
       <label>Сумма на каждый кошелёк, TON <input type="text" id="amount" value="0.05" inputmode="decimal"></label>
       <label>Количество кошельков <input type="number" id="count" min="1" max="1000" value="5"></label>
+    </div>
+    <div class="row">
+      <label>Формат новых кошельков
+        <select id="format" style="font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px">
+          <option value="gram" selected>Gram Wallet (12 + 12 слов, импортируется в Gram Wallet)</option>
+          <option value="ton">TON, 24 слова (старый формат)</option>
+        </select>
+      </label>
+      <label style="flex:0 0 auto;display:flex;gap:6px;align-items:center;color:var(--fg)"><input type="checkbox" id="refund" checked> Вернуть остаток на основной</label>
     </div>
     <div class="row">
       <label>Токен toncenter (API-ключ, необязательно) <input type="password" id="apikey" autocomplete="off" placeholder="без токена — медленнее, по одному кошельку"></label>
@@ -454,7 +505,7 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
     return j;
   }
   const input = () => ({ phrase: $('phrase').value, amount: $('amount').value, count: $('count').value,
-    apiKey: $('apikey').value, net: $('testnet').checked ? 'testnet' : 'mainnet' });
+    apiKey: $('apikey').value, net: $('testnet').checked ? 'testnet' : 'mainnet', format: $('format').value, refund: $('refund').checked });
   const msg = (t, err) => { $('msg').textContent = t || ''; $('msg').className = 'msg' + (err ? ' err' : ''); };
 
   $('check').addEventListener('click', async () => {
@@ -468,7 +519,8 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
       const total = Number(r.amount) * Number(r.count);
       $('plan').innerHTML = 'Сеть: <b>' + ($('testnet').checked ? 'тестовая' : 'ОСНОВНАЯ') + '</b>. Будет создано <b>' + r.count +
         '</b> кошельков, на каждый уйдёт <b>' + esc(r.amount) + ' TON</b> (всего ' + total.toFixed(4) +
-        ' TON плюс комиссии рассылки). После развёртывания остаток вернётся на основной кошелёк, на каждом новом останется ~0.001 TON.';
+        ' TON плюс комиссии рассылки), формат <b>' + (r.format === 'gram' ? 'Gram Wallet 12+12' : 'TON 24 слова') + '</b>. Кошельки развернутся этой же рассылкой. ' +
+        (r.refund ? 'Затем остаток вернётся на основной кошелёк, на каждом новом останется ~0.001 TON.' : 'Деньги останутся на новых кошельках.');
       $('confirm').hidden = false; msg('');
     } catch (e) { msg(e.message, true); }
     $('check').disabled = false;
@@ -481,7 +533,7 @@ td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
     $('stage').style.color = job.error ? 'var(--bad)' : '';
     $('table').innerHTML = '<tr><th>#</th><th>Адрес</th><th>Статус</th><th>Вернулось</th></tr>' + job.rows.map((r) =>
       '<tr><td class="num">' + r.n + '</td><td class="mono">' + esc(r.address) + '</td><td><span class="st ' + cls(r.status) + '">' + esc(r.status) +
-      '</span>' + (r.error ? '<div class="err-text">' + esc(r.error) + '</div>' : '') + '</td><td class="num">' + esc(r.returned ?? '') + '</td></tr>').join('');
+      '</span>' + (r.error ? '<div class="err-text">' + esc(r.error) + '</div>' : '') + '</td><td class="num">' + esc(r.returned ?? (r.left ? 'осталось ' + r.left : '')) + '</td></tr>').join('');
     $('log').textContent = job.log.join('\\n');
     $('log').scrollTop = $('log').scrollHeight;
     const done = job.rows.filter((r) => /готово|ошибка|остановлено/.test(r.status)).length;
